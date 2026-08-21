@@ -10,6 +10,7 @@ use gpui::{
 
 use super::blink::CursorBlink;
 use super::handler::EntityInputHandler;
+use super::InputHighlight;
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::bidi::{detect_base_direction, TextDirection};
@@ -131,6 +132,8 @@ pub struct InputState {
     pub(crate) line_layouts: Vec<InputLineLayout>,
     pub(crate) wrap_width: Option<Pixels>,
     pub(crate) text_style: Option<TextStyle>,
+    /// The normalized highlights used for the cached line layouts.
+    layout_highlights: Vec<InputHighlight>,
     pub(crate) needs_layout: bool,
     is_selecting: bool,
     last_click_position: Option<Point<Pixels>>,
@@ -212,6 +215,7 @@ impl InputState {
             line_layouts: Vec::new(),
             wrap_width: None,
             text_style: None,
+            layout_highlights: Vec::new(),
             needs_layout: true,
             is_selecting: false,
             last_click_position: None,
@@ -1380,24 +1384,99 @@ impl InputState {
         self.scroll_offset = self.scroll_offset.max(px(0.));
     }
 
+    fn normalize_highlights(content: &str, highlights: &[InputHighlight]) -> Vec<InputHighlight> {
+        let mut normalized = Vec::with_capacity(highlights.len());
+        let mut previous_end = 0;
+
+        for (range, style) in highlights {
+            if range.start == range.end {
+                continue;
+            }
+
+            let in_bounds = range.start <= range.end && range.end <= content.len();
+            let on_boundaries = in_bounds
+                && content.is_char_boundary(range.start)
+                && content.is_char_boundary(range.end);
+            let ordered = range.start >= previous_end;
+            let valid = in_bounds && on_boundaries && ordered;
+
+            debug_assert!(
+                valid,
+                "InputHighlight range must be sorted, non-overlapping, within the input content, and on UTF-8 character boundaries"
+            );
+            if !valid {
+                continue;
+            }
+
+            previous_end = range.end;
+            normalized.push((range.clone(), *style));
+        }
+
+        normalized
+    }
+
+    fn text_runs_for_line(
+        line_range: Range<usize>,
+        text_style: &TextStyle,
+        highlights: &[InputHighlight],
+    ) -> Vec<TextRun> {
+        let mut runs = Vec::new();
+        let mut offset = line_range.start;
+
+        for (highlight_range, highlight) in highlights {
+            if highlight_range.end <= line_range.start {
+                continue;
+            }
+            if highlight_range.start >= line_range.end {
+                break;
+            }
+
+            let start = highlight_range.start.max(line_range.start);
+            let end = highlight_range.end.min(line_range.end);
+            if start > offset {
+                runs.push(text_style.to_run(start - offset));
+            }
+            if end > start {
+                runs.push(text_style.clone().highlight(*highlight).to_run(end - start));
+                offset = end;
+            }
+        }
+
+        if offset < line_range.end {
+            runs.push(text_style.to_run(line_range.end - offset));
+        }
+
+        debug_assert_eq!(
+            runs.iter().map(|run| run.len).sum::<usize>(),
+            line_range.len(),
+            "input text runs must cover each logical line exactly once"
+        );
+        runs
+    }
+
     pub(crate) fn update_line_layouts(
         &mut self,
         width: Pixels,
         line_height: Pixels,
         text_style: &TextStyle,
+        highlights: &[InputHighlight],
         window: &mut Window,
     ) {
         self.line_height = line_height;
         self.set_text_style(text_style);
+        let highlights = Self::normalize_highlights(&self.content, highlights);
 
-        if !self.needs_layout && self.wrap_width == Some(width) {
+        if !self.needs_layout
+            && self.wrap_width == Some(width)
+            && self.layout_highlights == highlights
+        {
             return;
         }
 
         self.line_layouts.clear();
         self.wrap_width = Some(width);
+        self.layout_highlights = highlights;
 
-        let text_color = text_style.color;
         let font_size = text_style.font_size.to_pixels(window.rem_size());
 
         if self.content.is_empty() {
@@ -1437,21 +1516,18 @@ impl InputState {
             } else {
                 let direction = detect_base_direction(line_text);
                 last_direction = direction;
-                let run = TextRun {
-                    len: line_text.len(),
-                    font: text_style.font(),
-                    color: text_color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
+                let runs = Self::text_runs_for_line(
+                    current_pos..line_end,
+                    text_style,
+                    &self.layout_highlights,
+                );
 
                 let wrapped_lines = window
                     .text_system()
                     .shape_text(
                         SharedString::from(line_text.to_string()),
                         font_size,
-                        &[run],
+                        &runs,
                         Some(width),
                         None,
                     )
@@ -1947,8 +2023,8 @@ impl Focusable for InputState {
 mod tests {
     use super::*;
     use gpui::{
-        div, AppContext, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-        TestAppContext, TextStyle, WindowHandle,
+        div, AppContext, Entity, FontWeight, HighlightStyle, InteractiveElement, IntoElement,
+        ParentElement, Render, TestAppContext, TextStyle, WindowHandle,
     };
     use std::cell::Cell;
     use std::rc::Rc;
@@ -2043,12 +2119,45 @@ mod tests {
                 let mut input = InputState::new_multiline(cx);
                 input.content = content.to_string();
                 input.selected_range = range;
-                input.update_line_layouts(px(500.), px(20.), &TextStyle::default(), window);
+                input.update_line_layouts(px(500.), px(20.), &TextStyle::default(), &[], window);
                 input
             });
             TestView { input }
         });
         view
+    }
+
+    #[test]
+    fn highlights_split_each_logical_line_into_complete_runs() {
+        let style = HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        };
+        let text_style = TextStyle::default();
+        let highlights = vec![(1..6, style)];
+
+        let first_line = InputState::text_runs_for_line(0..4, &text_style, &highlights);
+        let second_line = InputState::text_runs_for_line(5..8, &text_style, &highlights);
+
+        assert_eq!(
+            first_line.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            second_line.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(first_line[1].font.weight, FontWeight::BOLD);
+        assert_eq!(second_line[0].font.weight, FontWeight::BOLD);
+        assert_eq!(first_line.iter().map(|run| run.len).sum::<usize>(), 4);
+        assert_eq!(second_line.iter().map(|run| run.len).sum::<usize>(), 3);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "InputHighlight range")]
+    fn inverted_highlight_ranges_are_rejected() {
+        InputState::normalize_highlights("hello", &[(4..2, HighlightStyle::default())]);
     }
 
     // ============================================================

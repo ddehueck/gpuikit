@@ -9,7 +9,7 @@ use gpui::{
 };
 
 use crate::element_id::for_entity;
-use crate::elements::input::{disabled_display, text_area};
+use crate::elements::input::{disabled_display, text_area, InputHighlight};
 use crate::input::InputState;
 use crate::theme::{ActiveTheme, ControlSize, Themeable};
 use crate::traits::control_sized::ControlSized;
@@ -57,6 +57,7 @@ pub struct Textarea {
     state: Entity<InputState>,
     focus_handle: FocusHandle,
     placeholder: Option<SharedString>,
+    highlights: Vec<InputHighlight>,
     rows: u32,
     disabled: bool,
     /// `None` means "say nothing about read-only" — see [`Textarea::read_only`].
@@ -75,6 +76,7 @@ impl Textarea {
             state: state.clone(),
             focus_handle: state.focus_handle(cx),
             placeholder: None,
+            highlights: Vec::new(),
             rows: DEFAULT_ROWS,
             disabled: false,
             read_only: None,
@@ -105,6 +107,14 @@ impl Textarea {
     /// Sets the placeholder text shown when the textarea is empty.
     pub fn placeholder(mut self, placeholder: impl Into<SharedString>) -> Self {
         self.placeholder = Some(placeholder.into());
+        self
+    }
+
+    /// Applies GPUI highlight styles to UTF-8 byte ranges in the current
+    /// content. Ranges must be sorted, non-overlapping, within the content,
+    /// and on character boundaries; empty ranges are ignored.
+    pub fn highlights(mut self, highlights: impl IntoIterator<Item = InputHighlight>) -> Self {
+        self.highlights = highlights.into_iter().collect();
         self
     }
 
@@ -259,7 +269,8 @@ impl RenderOnce for Textarea {
             let mut inner = text_area(&self.state, cx)
                 .control_size(self.size)
                 .size_full()
-                .text_color(text_color);
+                .text_color(text_color)
+                .highlights(self.highlights);
 
             if let Some(placeholder) = self.placeholder {
                 inner = inner.placeholder(placeholder);

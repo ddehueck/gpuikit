@@ -26,6 +26,8 @@ use crate::input::{
     INPUT_CONTEXT,
 };
 
+pub use crate::input::InputHighlight;
+
 const CURSOR_WIDTH: f32 = 2.0;
 const MARKED_TEXT_UNDERLINE_THICKNESS: f32 = 2.0;
 
@@ -52,6 +54,7 @@ pub struct Input {
     placeholder: Option<SharedString>,
     selection_color: Option<Hsla>,
     cursor_color: Option<Hsla>,
+    highlights: Vec<InputHighlight>,
     multiline: bool,
     size: ControlSize,
 }
@@ -66,6 +69,7 @@ impl Input {
             placeholder: None,
             selection_color: None,
             cursor_color: None,
+            highlights: Vec::new(),
             multiline,
             size: ControlSize::default(),
         };
@@ -88,6 +92,17 @@ impl Input {
     /// Sets the color of the text cursor.
     pub fn cursor_color(mut self, color: impl Into<Hsla>) -> Self {
         self.cursor_color = Some(color.into());
+        self
+    }
+
+    /// Applies GPUI highlight styles to UTF-8 byte ranges in the current
+    /// content. Ranges must be sorted, non-overlapping, within the content,
+    /// and on character boundaries; empty ranges are ignored.
+    ///
+    /// Highlights affect presentation only. The ranges are supplied again by
+    /// the caller when the content changes.
+    pub fn highlights(mut self, highlights: impl IntoIterator<Item = InputHighlight>) -> Self {
+        self.highlights = highlights.into_iter().collect();
         self
     }
 
@@ -349,7 +364,13 @@ impl Element for Input {
         self.input.update(cx, |input, _cx| {
             input.available_height = bounds.size.height;
             input.available_width = bounds.size.width;
-            input.update_line_layouts(wrap_width, line_height, &layout_state.text_style, window);
+            input.update_line_layouts(
+                wrap_width,
+                line_height,
+                &layout_state.text_style,
+                &self.highlights,
+                window,
+            );
         });
 
         let hitbox = self.interactivity.prepaint(
@@ -394,6 +415,7 @@ impl Element for Input {
         let placeholder = self.placeholder.clone();
         let text_style = layout_state.text_style.clone();
         let multiline = self.multiline;
+        let has_highlights = self.highlights.iter().any(|(range, _)| !range.is_empty());
         let is_focused = focus_handle.is_focused(window);
         // Asked unconditionally, so the blink state still follows focus, and
         // then suppressed: a caret promises that what you type lands there,
@@ -426,6 +448,7 @@ impl Element for Input {
                             placeholder.as_ref(),
                             &colors,
                             cursor_visible,
+                            has_highlights,
                             window,
                             cx,
                         );
@@ -438,6 +461,7 @@ impl Element for Input {
                             placeholder.as_ref(),
                             &colors,
                             cursor_visible,
+                            has_highlights,
                             window,
                             cx,
                         );
@@ -610,6 +634,7 @@ fn paint_multiline(
     placeholder: Option<&SharedString>,
     colors: &PaintColors,
     cursor_visible: bool,
+    has_highlights: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -622,19 +647,6 @@ fn paint_multiline(
     let scroll_offset = input_state.scroll_offset;
     let line_height = input_state.line_height;
     let is_focused = focus_handle.is_focused(window);
-
-    if !selected_range.is_empty() {
-        paint_multiline_selection(
-            &line_layouts,
-            &selected_range,
-            bounds,
-            scroll_offset,
-            line_height,
-            colors.selection,
-            window,
-        );
-    }
-
     if content.is_empty() {
         if let Some(placeholder_str) = placeholder {
             if !placeholder_str.is_empty() {
@@ -642,6 +654,29 @@ fn paint_multiline(
             }
         }
     } else {
+        if has_highlights {
+            paint_multiline_text_background(
+                &line_layouts,
+                bounds,
+                scroll_offset,
+                line_height,
+                window,
+                cx,
+            );
+        }
+
+        if !selected_range.is_empty() {
+            paint_multiline_selection(
+                &line_layouts,
+                &selected_range,
+                bounds,
+                scroll_offset,
+                line_height,
+                colors.selection,
+                window,
+            );
+        }
+
         paint_multiline_text(
             &line_layouts,
             bounds,
@@ -877,6 +912,44 @@ fn paint_multiline_placeholder(
     );
 }
 
+fn paint_multiline_text_background(
+    line_layouts: &[InputLineLayout],
+    bounds: Bounds<Pixels>,
+    scroll_offset: Pixels,
+    line_height: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    for line_layout in line_layouts {
+        let line_y = line_layout.y_offset - scroll_offset;
+
+        if !is_line_visible(
+            line_y,
+            line_height,
+            line_layout.visual_line_count,
+            bounds.size.height,
+        ) {
+            continue;
+        }
+
+        if let Some(wrapped) = &line_layout.wrapped_line {
+            let paint_pos = point(bounds.left(), bounds.top() + line_y);
+            let text_align = match line_layout.direction {
+                TextDirection::Ltr => TextAlign::Left,
+                TextDirection::Rtl => TextAlign::Right,
+            };
+            let _ = wrapped.paint_background(
+                paint_pos,
+                line_height,
+                text_align,
+                Some(bounds),
+                window,
+                cx,
+            );
+        }
+    }
+}
+
 fn paint_multiline_text(
     line_layouts: &[InputLineLayout],
     bounds: Bounds<Pixels>,
@@ -1099,12 +1172,14 @@ struct SingleLinePaintState {
     char_positions: Vec<Pixels>,
     wrapped_line: Option<Arc<WrappedLine>>,
     direction: TextDirection,
+    has_highlights: bool,
 }
 
 impl SingleLinePaintState {
     fn from_input(
         input: &Entity<InputState>,
         focus_handle: &FocusHandle,
+        has_highlights: bool,
         window: &Window,
         cx: &App,
     ) -> Self {
@@ -1153,6 +1228,7 @@ impl SingleLinePaintState {
             char_positions,
             wrapped_line,
             direction,
+            has_highlights,
         }
     }
 
@@ -1182,14 +1258,11 @@ fn paint_singleline(
     placeholder: Option<&SharedString>,
     colors: &PaintColors,
     cursor_visible: bool,
+    has_highlights: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let state = SingleLinePaintState::from_input(input, focus_handle, window, cx);
-
-    if !state.selected_range.is_empty() {
-        paint_singleline_selection(&state, bounds, colors.selection, window);
-    }
+    let state = SingleLinePaintState::from_input(input, focus_handle, has_highlights, window, cx);
 
     if state.content.is_empty() {
         if let Some(placeholder_str) = placeholder {
@@ -1198,6 +1271,14 @@ fn paint_singleline(
             }
         }
     } else {
+        if state.has_highlights {
+            paint_singleline_text_background(&state, bounds, window, cx);
+        }
+
+        if !state.selected_range.is_empty() {
+            paint_singleline_selection(&state, bounds, colors.selection, window);
+        }
+
         paint_singleline_text(&state, bounds, window, cx);
     }
 
@@ -1266,6 +1347,35 @@ fn paint_singleline_placeholder(
     let paint_origin = point(bounds.origin.x, bounds.origin.y + y_offset);
 
     let _ = shaped_line.paint(paint_origin, line_height, TextAlign::Left, None, window, cx);
+}
+
+fn paint_singleline_text_background(
+    state: &SingleLinePaintState,
+    bounds: Bounds<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(wrapped_line) = &state.wrapped_line else {
+        return;
+    };
+
+    let y_offset = (bounds.size.height - state.line_height).max(px(0.)) / 2.0;
+    let paint_origin = point(
+        bounds.origin.x - state.scroll_offset,
+        bounds.origin.y + y_offset,
+    );
+    let text_align = match state.direction {
+        TextDirection::Ltr => TextAlign::Left,
+        TextDirection::Rtl => TextAlign::Right,
+    };
+    let _ = wrapped_line.paint_background(
+        paint_origin,
+        state.line_height,
+        text_align,
+        Some(bounds),
+        window,
+        cx,
+    );
 }
 
 fn paint_singleline_text(
