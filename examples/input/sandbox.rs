@@ -13,10 +13,10 @@ mod fixtures;
 use gpui::{
     actions, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, size, App, Application,
     Background, Bounds, Context, DefiniteLength, Div, Entity, FocusHandle, Focusable, FontWeight,
-    Hsla, KeyBinding, SharedString, Stateful, Window, WindowBounds, WindowOptions,
+    HighlightStyle, Hsla, KeyBinding, SharedString, Stateful, Window, WindowBounds, WindowOptions,
 };
 use gpui_platform;
-use gpuikit::elements::input::{input, text_area};
+use gpuikit::elements::input::{input, text_area, InputHighlight};
 use gpuikit::elements::select::{select, SelectChanged, SelectState};
 use gpuikit::elements::slider::{Slider, SliderChanged};
 use gpuikit::input::{bind_input_keys, InputState};
@@ -383,6 +383,30 @@ impl InputSandbox {
     }
 }
 
+/// Highlights the first word so the same presentation can be checked in both
+/// single-line and multiline modes, including wrapping and selection.
+fn demo_highlights(content: &str) -> Vec<InputHighlight> {
+    let end = content
+        .char_indices()
+        .find(|(_, character)| character.is_whitespace())
+        .map(|(offset, _)| offset)
+        .unwrap_or(content.len());
+
+    if end == 0 {
+        Vec::new()
+    } else {
+        vec![(
+            0..end,
+            HighlightStyle {
+                color: Some(Theme::AccentLightPink.hsla()),
+                font_weight: Some(FontWeight::BOLD),
+                background_color: Some(Theme::AccentDarkBlue.hsla().alpha(0.65)),
+                ..Default::default()
+            },
+        )]
+    }
+}
+
 impl Focusable for InputSandbox {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.active_input().focus_handle(cx)
@@ -394,6 +418,7 @@ impl Render for InputSandbox {
         let active_input = self.active_input().clone();
         let input_state = active_input.read(cx);
         let content = input_state.content().to_string();
+        let highlights = demo_highlights(&content);
         let selected_range = input_state.selected_range().clone();
         let cursor_offset = input_state.cursor_offset();
         let char_count = content.chars().count();
@@ -448,7 +473,8 @@ impl Render for InputSandbox {
                                         .text_size(px(font_size))
                                         .line_height(DefiniteLength::Fraction(line_height))
                                         .selection_color(Theme::AccentLightPink.hsla().alpha(0.9))
-                                        .cursor_color(Theme::AccentLightBlue.hsla()),
+                                        .cursor_color(Theme::AccentLightBlue.hsla())
+                                        .highlights(highlights.clone()),
                                 )
                             })
                             .when(!self.use_multiline, |this| {
@@ -464,7 +490,8 @@ impl Render for InputSandbox {
                                             .selection_color(
                                                 Theme::AccentDarkPink.hsla().alpha(0.9),
                                             )
-                                            .cursor_color(Theme::AccentLightBlue.hsla()),
+                                            .cursor_color(Theme::AccentLightBlue.hsla())
+                                            .highlights(highlights.clone()),
                                     ),
                                 )
                             }),

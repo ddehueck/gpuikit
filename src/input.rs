@@ -22,6 +22,33 @@
 //! let input = cx.new(|cx| InputState::new_singleline(cx));
 //! ```
 
+use std::ops::Range;
+
+use gpui::HighlightStyle;
+
+/// A GPUI highlight applied to a UTF-8 byte range in the input content.
+///
+/// Ranges must be sorted, non-overlapping, within the current content, and
+/// begin and end on UTF-8 character boundaries. Empty ranges are ignored.
+///
+/// ```ignore
+/// use gpui::{rgb, HighlightStyle};
+/// use gpuikit::elements::input::{input, InputHighlight};
+/// use gpuikit::elements::textarea::textarea;
+///
+/// let highlights: Vec<InputHighlight> = vec![(
+///     0..5,
+///     HighlightStyle {
+///         color: Some(rgb(0x4ade80).into()),
+///         ..Default::default()
+///     },
+/// )];
+///
+/// input(&state, cx).highlights(highlights.clone());
+/// textarea(&state, cx).highlights(highlights);
+/// ```
+pub type InputHighlight = (Range<usize>, HighlightStyle);
+
 mod bidi;
 /// Input keybinding configuration & actions that can be bound (`Backspace`, `Copy`, etc.).
 ///
